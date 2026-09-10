@@ -42,7 +42,7 @@ jobs:
           UUID=$(cat /proc/sys/kernel/random/uuid)
           echo "UUID=$UUID" >> "$GITHUB_OUTPUT"
 
-      - name: Configure Xray (VLESS + TCP + Vision)
+      - name: Configure Xray (VLESS + TCP, no TLS)
         env:
           UUID: ${{ steps.uuid.outputs.UUID }}
         run: |
@@ -58,7 +58,7 @@ jobs:
                 "protocol": "vless",
                 "settings": {
                   "clients": [
-                    { "id": "$UUID", "flow": "xtls-rprx-vision" }
+                    { "id": "$UUID" }
                   ],
                   "decryption": "none"
                 },
@@ -83,16 +83,32 @@ jobs:
           sleep 2
           sudo systemctl status xray --no-pager
 
-      - name: Start iperf3 server (for baseline test)
+      - name: Start iperf3 server (as persistent systemd service)
         run: |
-          nohup iperf3 -s -p 5201 > /tmp/iperf3.log 2>&1 &
+          sudo tee /etc/systemd/system/iperf3.service > /dev/null <<'EOF'
+          [Unit]
+          Description=iperf3 server
+          After=network.target
+
+          [Service]
+          ExecStart=/usr/bin/iperf3 -s -p 5201
+          Restart=always
+          User=root
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now iperf3
+          sleep 2
+          sudo systemctl status iperf3 --no-pager
 
       - name: Build and show client config
         env:
           UUID: ${{ steps.uuid.outputs.UUID }}
         run: |
           TS_IP=$(tailscale ip -4)
-          LINK="vless://${UUID}@${TS_IP}:443?type=tcp&flow=xtls-rprx-vision&security=none#DX-Xray-Lab"
+          LINK="vless://${UUID}@${TS_IP}:443?type=tcp&security=none#DX-Xray-Lab"
 
           echo "=========================================="
           echo "       XRAY TAILSCALE LAB READY"
