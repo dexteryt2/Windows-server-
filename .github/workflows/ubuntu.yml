@@ -103,6 +103,37 @@ jobs:
           sleep 2
           sudo systemctl status iperf3 --no-pager
 
+      - name: Debug - Network & Service diagnostics
+        run: |
+          TS_IP=$(tailscale ip -4)
+          echo "===== tailscale status ====="
+          tailscale status
+          echo ""
+          echo "===== tailscale netcheck (relay/direct capability) ====="
+          tailscale netcheck || true
+          echo ""
+          echo "===== tailscale0 interface ====="
+          ip -4 addr show tailscale0
+          echo ""
+          echo "===== listening sockets (expect xray on :443, iperf3 on :5201) ====="
+          sudo ss -tlnp
+          echo ""
+          echo "===== host firewall rules (ufw/iptables) ====="
+          sudo iptables -L -n -v || true
+          sudo ufw status verbose 2>/dev/null || echo "ufw not active/installed"
+          echo ""
+          echo "===== self-test: connect to OWN Tailscale IP (rules out bind issues) ====="
+          echo "--- iperf3 (:5201) via TS_IP ---"
+          timeout 5 bash -c "echo > /dev/tcp/$TS_IP/5201" && echo "OK: 5201 reachable via $TS_IP" || echo "FAIL: 5201 NOT reachable via $TS_IP"
+          echo "--- xray (:443) via TS_IP ---"
+          timeout 5 bash -c "echo > /dev/tcp/$TS_IP/443" && echo "OK: 443 reachable via $TS_IP" || echo "FAIL: 443 NOT reachable via $TS_IP"
+          echo ""
+          echo "===== self-test: connect via 127.0.0.1 (rules out iperf3/xray bind-address bug) ====="
+          timeout 5 bash -c "echo > /dev/tcp/127.0.0.1/5201" && echo "OK: 5201 reachable via 127.0.0.1" || echo "FAIL: 5201 NOT reachable via 127.0.0.1"
+          timeout 5 bash -c "echo > /dev/tcp/127.0.0.1/443" && echo "OK: 443 reachable via 127.0.0.1" || echo "FAIL: 443 NOT reachable via 127.0.0.1 (expected: xray only listens on TS_IP, not 127.0.0.1)"
+          echo ""
+          echo "TS_IP for reference: $TS_IP"
+
       - name: Build and show client config
         env:
           UUID: ${{ steps.uuid.outputs.UUID }}
