@@ -1,0 +1,119 @@
+name: Xray Tailscale Lab
+
+on:
+  workflow_dispatch:
+
+jobs:
+  server:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Install Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up \
+            --authkey="$TAILSCALE_AUTHKEY" \
+            --hostname="dx-xray-lab"
+
+      - name: Install Xray
+        run: |
+          bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+          xray version
+
+      - name: Tune kernel (BBR + buffers)
+        run: |
+          echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.conf
+          echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a /etc/sysctl.conf
+          echo "net.core.rmem_max=67108864" | sudo tee -a /etc/sysctl.conf
+          echo "net.core.wmem_max=67108864" | sudo tee -a /etc/sysctl.conf
+          echo "net.ipv4.tcp_rmem=4096 87380 67108864" | sudo tee -a /etc/sysctl.conf
+          echo "net.ipv4.tcp_wmem=4096 65536 67108864" | sudo tee -a /etc/sysctl.conf
+          sudo sysctl -p
+
+      - name: Install iperf3 (baseline testing)
+        run: sudo apt-get update -y && sudo apt-get install -y iperf3 jq
+
+      - name: Generate UUID
+        id: uuid
+        run: |
+          UUID=$(cat /proc/sys/kernel/random/uuid)
+          echo "UUID=$UUID" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Xray (VLESS + TCP + Vision)
+        env:
+          UUID: ${{ steps.uuid.outputs.UUID }}
+        run: |
+          TS_IP=$(tailscale ip -4)
+          sudo mkdir -p /usr/local/etc/xray
+          sudo tee /usr/local/etc/xray/config.json > /dev/null <<EOF
+          {
+            "log": { "loglevel": "warning" },
+            "inbounds": [
+              {
+                "listen": "$TS_IP",
+                "port": 443,
+                "protocol": "vless",
+                "settings": {
+                  "clients": [
+                    { "id": "$UUID", "flow": "xtls-rprx-vision" }
+                  ],
+                  "decryption": "none"
+                },
+                "streamSettings": {
+                  "network": "raw",
+                  "security": "none"
+                }
+              }
+            ],
+            "outbounds": [
+              { "protocol": "freedom", "tag": "direct" },
+              { "protocol": "blackhole", "tag": "block" }
+            ]
+          }
+          EOF
+          sudo xray run -test -config /usr/local/etc/xray/config.json
+
+      - name: Start Xray
+        run: |
+          sudo systemctl restart xray
+          sudo systemctl enable xray
+          sleep 2
+          sudo systemctl status xray --no-pager
+
+      - name: Start iperf3 server (for baseline test)
+        run: |
+          nohup iperf3 -s -p 5201 > /tmp/iperf3.log 2>&1 &
+
+      - name: Build and show client config
+        env:
+          UUID: ${{ steps.uuid.outputs.UUID }}
+        run: |
+          TS_IP=$(tailscale ip -4)
+          LINK="vless://${UUID}@${TS_IP}:443?type=tcp&flow=xtls-rprx-vision&security=none#DX-Xray-Lab"
+
+          echo "=========================================="
+          echo "       XRAY TAILSCALE LAB READY"
+          echo "=========================================="
+          echo ""
+          echo "کانفیگ آماده (import در v2rayNG / nekobox / v2box):"
+          echo ""
+          echo "$LINK"
+          echo ""
+          echo "------------------------------------------"
+          echo "iperf3 baseline test از گوشی:"
+          echo "iperf3 -c $TS_IP -p 5201"
+          echo "------------------------------------------"
+          echo ""
+          echo "توجه: گوشی باید در همان Tailnet وصل باشد وگرنه"
+          echo "این آدرس ($TS_IP) در دسترس نیست."
+          echo "=========================================="
+
+      - name: Keep Server Alive
+        run: |
+          for i in $(seq 1 350); do
+            sleep 60
+            echo "[$i/350] Xray lab running..."
+          done
