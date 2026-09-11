@@ -1,4 +1,4 @@
-name: Xray REALITY Lab
+name: Xray Cloudflare Tunnel Lab
 
 on:
   workflow_dispatch:
@@ -9,8 +9,8 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # Tailscale is ONLY for your own management access to the box (ssh, debugging).
-      # It is NOT in the VPN data path anymore, so its throttling no longer matters.
+      # Tailscale is ONLY for your own management access (ssh/debugging).
+      # It is NOT in the VPN data path.
       - name: Install Tailscale (management access only)
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
@@ -18,7 +18,7 @@ jobs:
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTHKEY" \
-            --hostname="dx-xray-reality"
+            --hostname="dx-xray-cf"
           sudo apt-get install -y openssh-server
           sudo systemctl enable --now ssh
 
@@ -27,37 +27,22 @@ jobs:
           sudo bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
           xray version
 
-      - name: Tune kernel (BBR + buffers)
+      - name: Install cloudflared
         run: |
-          echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.conf
-          echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a /etc/sysctl.conf
-          echo "net.core.rmem_max=67108864" | sudo tee -a /etc/sysctl.conf
-          echo "net.core.wmem_max=67108864" | sudo tee -a /etc/sysctl.conf
-          echo "net.ipv4.tcp_rmem=4096 87380 67108864" | sudo tee -a /etc/sysctl.conf
-          echo "net.ipv4.tcp_wmem=4096 65536 67108864" | sudo tee -a /etc/sysctl.conf
-          sudo sysctl -p
+          curl -fsSL -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
 
-      - name: Generate UUID + REALITY keys
+      - name: Generate UUID
         id: gen
         run: |
           UUID=$(cat /proc/sys/kernel/random/uuid)
-          KEYS=$(xray x25519)
-          PRIVATE_KEY=$(echo "$KEYS" | grep -i "Private" | awk '{print $NF}')
-          PUBLIC_KEY=$(echo "$KEYS" | grep -i "Public" | awk '{print $NF}')
-          SHORT_ID=$(openssl rand -hex 8)
-          PUBLIC_IP=$(curl -s https://api.ipify.org)
-
           echo "UUID=$UUID" >> "$GITHUB_OUTPUT"
-          echo "PRIVATE_KEY=$PRIVATE_KEY" >> "$GITHUB_OUTPUT"
-          echo "PUBLIC_KEY=$PUBLIC_KEY" >> "$GITHUB_OUTPUT"
-          echo "SHORT_ID=$SHORT_ID" >> "$GITHUB_OUTPUT"
-          echo "PUBLIC_IP=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
 
-      - name: Configure Xray (VLESS + REALITY + Vision)
+      - name: Configure Xray (VLESS + WebSocket, loopback only)
         env:
           UUID: ${{ steps.gen.outputs.UUID }}
-          PRIVATE_KEY: ${{ steps.gen.outputs.PRIVATE_KEY }}
-          SHORT_ID: ${{ steps.gen.outputs.SHORT_ID }}
         run: |
           sudo mkdir -p /usr/local/etc/xray
           sudo tee /usr/local/etc/xray/config.json > /dev/null <<EOF
@@ -65,26 +50,17 @@ jobs:
             "log": { "loglevel": "warning" },
             "inbounds": [
               {
-                "listen": "0.0.0.0",
-                "port": 443,
+                "listen": "127.0.0.1",
+                "port": 8080,
                 "protocol": "vless",
                 "settings": {
-                  "clients": [
-                    { "id": "$UUID", "flow": "xtls-rprx-vision" }
-                  ],
+                  "clients": [ { "id": "$UUID" } ],
                   "decryption": "none"
                 },
                 "streamSettings": {
-                  "network": "tcp",
-                  "security": "reality",
-                  "realitySettings": {
-                    "show": false,
-                    "dest": "www.microsoft.com:443",
-                    "xver": 0,
-                    "serverNames": ["www.microsoft.com"],
-                    "privateKey": "$PRIVATE_KEY",
-                    "shortIds": ["$SHORT_ID"]
-                  }
+                  "network": "ws",
+                  "security": "none",
+                  "wsSettings": { "path": "/ws" }
                 }
               }
             ],
@@ -103,33 +79,51 @@ jobs:
           sleep 2
           sudo systemctl status xray --no-pager
 
-      - name: Debug - Network & Service diagnostics
-        env:
-          PUBLIC_IP: ${{ steps.gen.outputs.PUBLIC_IP }}
+      - name: Start Cloudflare Quick Tunnel
         run: |
-          echo "===== listening sockets (expect xray on 0.0.0.0:443) ====="
-          sudo ss -tlnp
+          # setsid detaches this from the step's process group so it survives
+          # after this step ends (plain nohup alone is NOT enough on GH Actions).
+          setsid nohup cloudflared tunnel --url http://localhost:8080 \
+            > /tmp/cloudflared.log 2>&1 < /dev/null &
+          disown
+
+          echo "Waiting for tunnel hostname..."
+          for i in $(seq 1 30); do
+            CF_HOST=$(grep -oE '[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n1)
+            if [ -n "$CF_HOST" ]; then
+              echo "Tunnel ready: $CF_HOST"
+              echo "CF_HOST=$CF_HOST" >> "$GITHUB_ENV"
+              break
+            fi
+            sleep 1
+          done
+
+          if [ -z "$CF_HOST" ]; then
+            echo "FAILED to get tunnel hostname, dumping log:"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+      - name: Debug - verify tunnel end-to-end
+        run: |
+          echo "===== cloudflared log ====="
+          cat /tmp/cloudflared.log
           echo ""
-          echo "===== host firewall rules ====="
-          sudo iptables -L -n -v || true
-          sudo ufw status verbose 2>/dev/null || echo "ufw not active"
+          echo "===== xray listening on loopback? ====="
+          sudo ss -tlnp | grep 8080 || echo "NOT LISTENING"
           echo ""
-          echo "===== self-test: connect to PUBLIC IP from outside-facing socket ====="
-          timeout 5 bash -c "echo > /dev/tcp/$PUBLIC_IP/443" && echo "OK: 443 reachable via $PUBLIC_IP" || echo "FAIL: 443 NOT reachable via $PUBLIC_IP"
-          echo ""
-          echo "Public IP for reference: $PUBLIC_IP"
+          echo "===== self-test through the public tunnel hostname ====="
+          curl -sS -o /dev/null -w "HTTP status via tunnel: %{http_code}\n" \
+            "https://$CF_HOST/ws" --max-time 10 || echo "curl failed"
 
       - name: Build and show client config
         env:
           UUID: ${{ steps.gen.outputs.UUID }}
-          PUBLIC_KEY: ${{ steps.gen.outputs.PUBLIC_KEY }}
-          SHORT_ID: ${{ steps.gen.outputs.SHORT_ID }}
-          PUBLIC_IP: ${{ steps.gen.outputs.PUBLIC_IP }}
         run: |
-          LINK="vless://${UUID}@${PUBLIC_IP}:443?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.microsoft.com&sid=${SHORT_ID}#DX-Xray-Reality"
+          LINK="vless://${UUID}@${CF_HOST}:443?encryption=none&security=tls&type=ws&host=${CF_HOST}&path=%2Fws&sni=${CF_HOST}#DX-Xray-CF"
 
           echo "=========================================="
-          echo "       XRAY REALITY LAB READY"
+          echo "     XRAY over CLOUDFLARE TUNNEL READY"
           echo "=========================================="
           echo ""
           echo "کانفیگ (import در v2rayNG / v2box / NekoBox):"
@@ -137,8 +131,8 @@ jobs:
           echo "$LINK"
           echo ""
           echo "------------------------------------------"
-          echo "این کانفیگ مستقیم روی IP عمومی سرور کار می‌کند،"
-          echo "از تونل Tailscale/WireGuard عبور نمی‌کند."
+          echo "این کانفیگ از طریق Cloudflare (خروجی، نه ورودی)"
+          echo "کار می‌کند، نه از Tailscale و نه IP مستقیم."
           echo "------------------------------------------"
           echo "=========================================="
 
@@ -146,5 +140,8 @@ jobs:
         run: |
           for i in $(seq 1 350); do
             sleep 60
-            echo "[$i/350] Xray REALITY lab running..."
+            if ! pgrep -f "cloudflared tunnel" > /dev/null; then
+              echo "[$i/350] WARNING: cloudflared died, restarting is NOT automatic - check logs"
+            fi
+            echo "[$i/350] Server running..."
           done
