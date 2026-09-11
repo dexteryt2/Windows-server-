@@ -1,4 +1,4 @@
-name: Xray Tailscale Lab
+name: Xray REALITY Lab
 
 on:
   workflow_dispatch:
@@ -9,14 +9,18 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Install Tailscale
+      # Tailscale is ONLY for your own management access to the box (ssh, debugging).
+      # It is NOT in the VPN data path anymore, so its throttling no longer matters.
+      - name: Install Tailscale (management access only)
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTHKEY" \
-            --hostname="dx-xray-lab"
+            --hostname="dx-xray-reality"
+          sudo apt-get install -y openssh-server
+          sudo systemctl enable --now ssh
 
       - name: Install Xray
         run: |
@@ -33,38 +37,54 @@ jobs:
           echo "net.ipv4.tcp_wmem=4096 65536 67108864" | sudo tee -a /etc/sysctl.conf
           sudo sysctl -p
 
-      - name: Install iperf3 (baseline testing)
-        run: sudo apt-get update -y && sudo apt-get install -y iperf3 jq
-
-      - name: Generate UUID
-        id: uuid
+      - name: Generate UUID + REALITY keys
+        id: gen
         run: |
           UUID=$(cat /proc/sys/kernel/random/uuid)
-          echo "UUID=$UUID" >> "$GITHUB_OUTPUT"
+          KEYS=$(xray x25519)
+          PRIVATE_KEY=$(echo "$KEYS" | grep -i "Private" | awk '{print $NF}')
+          PUBLIC_KEY=$(echo "$KEYS" | grep -i "Public" | awk '{print $NF}')
+          SHORT_ID=$(openssl rand -hex 8)
+          PUBLIC_IP=$(curl -s https://api.ipify.org)
 
-      - name: Configure Xray (VLESS + TCP, no TLS)
+          echo "UUID=$UUID" >> "$GITHUB_OUTPUT"
+          echo "PRIVATE_KEY=$PRIVATE_KEY" >> "$GITHUB_OUTPUT"
+          echo "PUBLIC_KEY=$PUBLIC_KEY" >> "$GITHUB_OUTPUT"
+          echo "SHORT_ID=$SHORT_ID" >> "$GITHUB_OUTPUT"
+          echo "PUBLIC_IP=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Xray (VLESS + REALITY + Vision)
         env:
-          UUID: ${{ steps.uuid.outputs.UUID }}
+          UUID: ${{ steps.gen.outputs.UUID }}
+          PRIVATE_KEY: ${{ steps.gen.outputs.PRIVATE_KEY }}
+          SHORT_ID: ${{ steps.gen.outputs.SHORT_ID }}
         run: |
-          TS_IP=$(tailscale ip -4)
           sudo mkdir -p /usr/local/etc/xray
           sudo tee /usr/local/etc/xray/config.json > /dev/null <<EOF
           {
             "log": { "loglevel": "warning" },
             "inbounds": [
               {
-                "listen": "$TS_IP",
+                "listen": "0.0.0.0",
                 "port": 443,
                 "protocol": "vless",
                 "settings": {
                   "clients": [
-                    { "id": "$UUID" }
+                    { "id": "$UUID", "flow": "xtls-rprx-vision" }
                   ],
                   "decryption": "none"
                 },
                 "streamSettings": {
-                  "network": "raw",
-                  "security": "none"
+                  "network": "tcp",
+                  "security": "reality",
+                  "realitySettings": {
+                    "show": false,
+                    "dest": "www.microsoft.com:443",
+                    "xver": 0,
+                    "serverNames": ["www.microsoft.com"],
+                    "privateKey": "$PRIVATE_KEY",
+                    "shortIds": ["$SHORT_ID"]
+                  }
                 }
               }
             ],
@@ -83,84 +103,48 @@ jobs:
           sleep 2
           sudo systemctl status xray --no-pager
 
-      - name: Start iperf3 server (as persistent systemd service)
-        run: |
-          sudo tee /etc/systemd/system/iperf3.service > /dev/null <<'EOF'
-          [Unit]
-          Description=iperf3 server
-          After=network.target
-
-          [Service]
-          ExecStart=/usr/bin/iperf3 -s -p 5201
-          Restart=always
-          User=root
-
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-          sudo systemctl daemon-reload
-          sudo systemctl enable --now iperf3
-          sleep 2
-          sudo systemctl status iperf3 --no-pager
-
       - name: Debug - Network & Service diagnostics
+        env:
+          PUBLIC_IP: ${{ steps.gen.outputs.PUBLIC_IP }}
         run: |
-          TS_IP=$(tailscale ip -4)
-          echo "===== tailscale status ====="
-          tailscale status
-          echo ""
-          echo "===== tailscale netcheck (relay/direct capability) ====="
-          tailscale netcheck || true
-          echo ""
-          echo "===== tailscale0 interface ====="
-          ip -4 addr show tailscale0
-          echo ""
-          echo "===== listening sockets (expect xray on :443, iperf3 on :5201) ====="
+          echo "===== listening sockets (expect xray on 0.0.0.0:443) ====="
           sudo ss -tlnp
           echo ""
-          echo "===== host firewall rules (ufw/iptables) ====="
+          echo "===== host firewall rules ====="
           sudo iptables -L -n -v || true
-          sudo ufw status verbose 2>/dev/null || echo "ufw not active/installed"
+          sudo ufw status verbose 2>/dev/null || echo "ufw not active"
           echo ""
-          echo "===== self-test: connect to OWN Tailscale IP (rules out bind issues) ====="
-          echo "--- iperf3 (:5201) via TS_IP ---"
-          timeout 5 bash -c "echo > /dev/tcp/$TS_IP/5201" && echo "OK: 5201 reachable via $TS_IP" || echo "FAIL: 5201 NOT reachable via $TS_IP"
-          echo "--- xray (:443) via TS_IP ---"
-          timeout 5 bash -c "echo > /dev/tcp/$TS_IP/443" && echo "OK: 443 reachable via $TS_IP" || echo "FAIL: 443 NOT reachable via $TS_IP"
+          echo "===== self-test: connect to PUBLIC IP from outside-facing socket ====="
+          timeout 5 bash -c "echo > /dev/tcp/$PUBLIC_IP/443" && echo "OK: 443 reachable via $PUBLIC_IP" || echo "FAIL: 443 NOT reachable via $PUBLIC_IP"
           echo ""
-          echo "===== self-test: connect via 127.0.0.1 (rules out iperf3/xray bind-address bug) ====="
-          timeout 5 bash -c "echo > /dev/tcp/127.0.0.1/5201" && echo "OK: 5201 reachable via 127.0.0.1" || echo "FAIL: 5201 NOT reachable via 127.0.0.1"
-          timeout 5 bash -c "echo > /dev/tcp/127.0.0.1/443" && echo "OK: 443 reachable via 127.0.0.1" || echo "FAIL: 443 NOT reachable via 127.0.0.1 (expected: xray only listens on TS_IP, not 127.0.0.1)"
-          echo ""
-          echo "TS_IP for reference: $TS_IP"
+          echo "Public IP for reference: $PUBLIC_IP"
 
       - name: Build and show client config
         env:
-          UUID: ${{ steps.uuid.outputs.UUID }}
+          UUID: ${{ steps.gen.outputs.UUID }}
+          PUBLIC_KEY: ${{ steps.gen.outputs.PUBLIC_KEY }}
+          SHORT_ID: ${{ steps.gen.outputs.SHORT_ID }}
+          PUBLIC_IP: ${{ steps.gen.outputs.PUBLIC_IP }}
         run: |
-          TS_IP=$(tailscale ip -4)
-          LINK="vless://${UUID}@${TS_IP}:443?type=tcp&security=none#DX-Xray-Lab"
+          LINK="vless://${UUID}@${PUBLIC_IP}:443?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.microsoft.com&sid=${SHORT_ID}#DX-Xray-Reality"
 
           echo "=========================================="
-          echo "       XRAY TAILSCALE LAB READY"
+          echo "       XRAY REALITY LAB READY"
           echo "=========================================="
           echo ""
-          echo "کانفیگ آماده (import در v2rayNG / nekobox / v2box):"
+          echo "کانفیگ (import در v2rayNG / v2box / NekoBox):"
           echo ""
           echo "$LINK"
           echo ""
           echo "------------------------------------------"
-          echo "iperf3 baseline test از گوشی:"
-          echo "iperf3 -c $TS_IP -p 5201"
+          echo "این کانفیگ مستقیم روی IP عمومی سرور کار می‌کند،"
+          echo "از تونل Tailscale/WireGuard عبور نمی‌کند."
           echo "------------------------------------------"
-          echo ""
-          echo "توجه: گوشی باید در همان Tailnet وصل باشد وگرنه"
-          echo "این آدرس ($TS_IP) در دسترس نیست."
           echo "=========================================="
 
       - name: Keep Server Alive
         run: |
           for i in $(seq 1 350); do
             sleep 60
-            echo "[$i/350] Xray lab running..."
+            echo "[$i/350] Xray REALITY lab running..."
           done
